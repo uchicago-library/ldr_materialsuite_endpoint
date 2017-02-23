@@ -4,6 +4,7 @@ from uuid import uuid4
 from os import makedirs
 from datetime import datetime
 from hashlib import md5 as _md5
+import logging
 
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
@@ -29,12 +30,18 @@ BLUEPRINT.config = {
 API = Api(BLUEPRINT)
 
 
+log = logging.getLogger(__name__)
+
+
 class MaterialSuite(Resource):
     def get(self, id):
+        log.info("GET received @ MaterialSuite endpoint")
         if Path(BLUEPRINT.config['LTS_PATH'], id_to_path(id), "arf").is_dir():
+            log.debug("Found MaterialSuite with id: {}".format(id))
             return {"premis": API.url_for(MaterialSuitePREMIS, id=id),
                     "content": API.url_for(MaterialSuiteContent, id=id),
                     "_self": API.url_for(MaterialSuite, id=id)}
+        log.debug("No MaterialSuite found with id: {}".format(id))
 
     # nuclear delete?
     def delete(self, id):
@@ -43,10 +50,15 @@ class MaterialSuite(Resource):
 
 class MaterialSuiteContent(Resource):
     def get(self, id):
+        log.info("GET received @ MaterialSuiteContent endpoint")
         req_path = Path(BLUEPRINT.config['LTS_PATH'], id_to_path(id), "arf",
                         "content.file")
         if req_path.is_file():
+            log.debug("Content found for MaterialSuite with id: {}".format(
+                id))
             return send_file(str(req_path))
+        log.debug("No content found for MaterialSuite with id: {}".format(
+            id))
 
     # de-accession
     def delete(self, id):
@@ -55,12 +67,24 @@ class MaterialSuiteContent(Resource):
 
 class MaterialSuitePREMIS(Resource):
     def get(self, id):
+        log.info("GET received @ MaterialSuitePremis endpoint")
         req_path = Path(BLUEPRINT.config['PREMIS_PATH'], id_to_path(id), "arf",
                         "premis.xml")
         if req_path.is_file():
+            log.debug("Premis found for MaterialSuite with id: {}".format(
+                id))
             return send_file(str(req_path))
+        log.debug("No premis found for MaterialSuite with id: {}".format(
+            id))
 
     def put(self, id):
+        # TODO
+        # When scaling this microservice this functionality introduces a race
+        # condition if the premis environment is shared amongst nodes.
+        log.info("PUT received @ MaterialSuitePremis endpoint")
+        log.warn("THIS ENDPOINT CURRENTLY INTRODUCES A RACE CONDITION IF " +
+                 "THIS SERVICE IS SCALED OR RUNNING MULTITHREADED")
+        log.debug("Parsing arguments")
         parser = reqparse.RequestParser()
         parser.add_argument(
             "premis",
@@ -70,12 +94,15 @@ class MaterialSuitePREMIS(Resource):
             location="files"
         )
         args = parser.parse_args()
+        log.debug("Arguments parsed")
 
         rec_path = Path(BLUEPRINT.config['PREMIS_PATH'], id_to_path(id), "arf",
                         "premis.xml")
         if not rec_path.is_file():
             # you can't use this to create PREMIS records, only update them
+            log.critical("No PREMIS found for {}".format(id))
             abort(404)
+        log.debug("Saving PREMIS file")
         args['premis'].save(str(rec_path))
         return {"_self": API.url_for(MaterialSuitePREMIS, id=id)}
 
@@ -95,7 +122,8 @@ class AddMaterialSuite(Resource):
                 return EventIdentifier("uuid4", uuid4().hex)
 
             def _build_event():
-                e = Event(_build_eventIdentifier(), "ingestion", datetime.now().isoformat())
+                e = Event(_build_eventIdentifier(),
+                          "ingestion", datetime.now().isoformat())
                 e.add_eventDetailInformation(_build_eventDetailInformation())
                 return e
 
@@ -116,6 +144,8 @@ class AddMaterialSuite(Resource):
                     if fixity.get_messageDigestAlgorithm() == "md5":
                         return fixity.get_messageDigest()
 
+        log.info("POST received @ AddMaterialSuite endpoint")
+        log.debug("Parsing arguments")
         parser = reqparse.RequestParser()
         parser.add_argument(
             "content",
@@ -132,16 +162,25 @@ class AddMaterialSuite(Resource):
             required=True
         )
         args = parser.parse_args()
+        log.debug("Arguments parsed")
 
         premis_rec = None
+        log.debug("Instantiating and reading PREMIS")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_premis_path = str(Path(tmpdir, uuid4().hex))
             args['premis'].save(tmp_premis_path)
             premis_rec = PremisRecord(frompath=tmp_premis_path)
+        log.debug("Getting the identifier")
         identifier = premis_rec.get_object_list()[0].\
             get_objectIdentifier()[0].\
             get_objectIdentifierValue()
-        assert(identifier == secure_filename(identifier))
+        if identifier != secure_filename(identifier):
+            log.critical(
+                "Insecure identifier detected! ({})".format(identifier)
+            )
+            abort(500)
+        else:
+            log.debug("Identifier Found: {}".format(identifier))
 
         content_dir = str(Path(BLUEPRINT.config['LTS_PATH'],
                                id_to_path(identifier),
@@ -149,12 +188,16 @@ class AddMaterialSuite(Resource):
         premis_dir = str(Path(BLUEPRINT.config['PREMIS_PATH'],
                               id_to_path(identifier),
                               "arf"))
+        log.debug("Creating containing dirs")
         makedirs(content_dir)
         makedirs(premis_dir)
 
         target_content_path = str(Path(content_dir, "content.file"))
 
+        log.debug("Saving content")
         args['content'].save(target_content_path)
+        log.debug("Content saved")
+        log.debug("Calculating md5 of file")
         md5 = None
         with open(str(target_content_path), "rb") as f:
             hasher = _md5()
@@ -163,11 +206,22 @@ class AddMaterialSuite(Resource):
                 hasher.update(data)
                 data = f.read(BLUEPRINT.config['BUFF'])
             md5 = hasher.hexdigest()
+        log.debug("md5 of file calculated: {}".format(md5))
+        log.debug("Retrieving md5 from PREMIS")
         premis_md5 = get_md5_from_premis(premis_rec)
-        assert(md5 == premis_md5)
+        log.debug("PREMIS md5 retrieved: {}".format(premis_md5))
+        if md5 != premis_md5:
+            log.critical("PREMIS md5 and calculated md5 do not match!")
+            abort(500)
+        else:
+            log.debug("Calculated md5 and PREMIS md5 match")
+        log.debug("Adding ingest event to PREMIS record")
         add_ingest_event(premis_rec)
+        log.debug("Ingest event added")
+        log.debug("Writing PREMIS to file")
         target_premis_path = str(Path(premis_dir, "premis.xml"))
         premis_rec.write_to_file(target_premis_path)
+        log.debug("PREMIS written")
         return {"created": API.url_for(MaterialSuite, id=identifier)}
 
 
@@ -177,6 +231,10 @@ def handle_configs(setup_state):
     BLUEPRINT.config.update(app.config)
     if BLUEPRINT.config.get("TEMPDIR"):
                 tempfile.tempdir = BLUEPRINT.config['TEMPDIR']
+    if BLUEPRINT.config.get("VERBOSITY"):
+        logging.basicConfig(level=BLUEPRINT.config['VERBOSITY'])
+    else:
+        logging.basicConfig(level="WARN")
 
 API.add_resource(AddMaterialSuite, "/add")
 API.add_resource(MaterialSuite, "/<string:id>")
