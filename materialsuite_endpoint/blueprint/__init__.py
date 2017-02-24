@@ -193,6 +193,11 @@ class AddMaterialSuite(Resource):
         makedirs(premis_dir)
 
         target_content_path = str(Path(content_dir, "content.file"))
+        target_premis_path = str(Path(premis_dir, "premis.xml"))
+        if Path(target_content_path).exists() or \
+                Path(target_premis_path).exists():
+            # Never clobber stuff
+            abort(500)
 
         log.debug("Saving content")
         args['content'].save(target_content_path)
@@ -219,7 +224,6 @@ class AddMaterialSuite(Resource):
         add_ingest_event(premis_rec)
         log.debug("Ingest event added")
         log.debug("Writing PREMIS to file")
-        target_premis_path = str(Path(premis_dir, "premis.xml"))
         premis_rec.write_to_file(target_premis_path)
         log.debug("PREMIS written")
         return {"created": API.url_for(MaterialSuite, id=identifier)}
