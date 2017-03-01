@@ -32,6 +32,9 @@ API = Api(BLUEPRINT)
 
 log = logging.getLogger(__name__)
 
+class Root(Resource):
+    def get(self):
+        return {"status": True}
 
 class MaterialSuite(Resource):
     def get(self, id):
@@ -240,6 +243,7 @@ def handle_configs(setup_state):
     else:
         logging.basicConfig(level="WARN")
 
+API.add_resource(Root, "/")
 API.add_resource(AddMaterialSuite, "/add")
 API.add_resource(MaterialSuite, "/<string:id>")
 API.add_resource(MaterialSuiteContent, "/<string:id>/content")
