@@ -1,7 +1,7 @@
 import tempfile
 from pathlib import Path
 from uuid import uuid4
-from os import makedirs
+from os import makedirs, scandir
 from datetime import datetime
 from hashlib import md5 as _md5
 import logging
@@ -16,6 +16,7 @@ from pypremis.nodes import Event, EventDetailInformation, EventIdentifier
 from pypremis.factories import LinkingObjectIdentifierFactory, \
     LinkingEventIdentifierFactory
 from pypairtree.utils import identifier_to_path as id_to_path
+from pypairtree.utils import path_to_identifier as path_to_id
 
 BLUEPRINT = Blueprint('materialsuite_endpoint', __name__)
 
@@ -32,9 +33,35 @@ API = Api(BLUEPRINT)
 
 log = logging.getLogger(__name__)
 
+# This is HEAVILY linked to disk read time, and so probably won't scale well
+def get_ids(root):
+    def get_files(path):
+        for entry in scandir(path):
+            if entry.is_file():
+                yield entry.path
+            elif entry.is_dir():
+                yield from get_files(entry.path)
+
+    return [path_to_id(Path(x).relative_to(root).parent.parent) for x in
+            get_files(root)]
+
+
+def check_limit(x):
+    if x > BLUEPRINT.config.get("MAX_LIMIT", 1000):
+        return BLUEPRINT.config.get("MAX_LIMIT", 1000)
+    return x
+
+
 class Root(Resource):
     def get(self):
-        return {"status": True}
+        parser = reqparse.RequestParser()
+        parser.add_argument("offset", type=int, default=0)
+        parser.add_argument("limit", type=int, default=1000)
+        args = parser.parse_args()
+        args['limit'] = check_limit(args['limit'])
+        paginated_ids = sorted(get_ids(BLUEPRINT.config['LTS_PATH']))[args['offset']:args['offset']+args['limit']]
+        return {"materialsuites": [{"identifier": x, "_link": API.url_for(MaterialSuite, id=x)} for x
+                                   in paginated_ids]}
 
 class MaterialSuite(Resource):
     def get(self, id):
