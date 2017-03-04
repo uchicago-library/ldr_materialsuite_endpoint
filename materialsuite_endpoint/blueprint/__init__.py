@@ -1,7 +1,6 @@
 import tempfile
 from pathlib import Path
 from uuid import uuid4
-from os import makedirs, scandir
 from datetime import datetime
 from hashlib import md5 as _md5
 import logging
@@ -11,12 +10,13 @@ from werkzeug.utils import secure_filename
 from flask import Blueprint, abort, send_file
 from flask_restful import Resource, Api, reqparse
 
+from pymongo import MongoClient, ASCENDING
+from gridfs import GridFS
+
 from pypremis.lib import PremisRecord
 from pypremis.nodes import Event, EventDetailInformation, EventIdentifier
 from pypremis.factories import LinkingObjectIdentifierFactory, \
     LinkingEventIdentifierFactory
-from pypairtree.utils import identifier_to_path as id_to_path
-from pypairtree.utils import path_to_identifier as path_to_id
 
 BLUEPRINT = Blueprint('materialsuite_endpoint', __name__)
 
@@ -24,7 +24,15 @@ BLUEPRINT = Blueprint('materialsuite_endpoint', __name__)
 BLUEPRINT.config = {
     'LTS_PATH': str(Path(tempfile.gettempdir(), 'lts')),
     'PREMIS_PATH': str(Path(tempfile.gettempdir(), 'premis')),
-    'BUFF': 65536
+    'MONGO_LTS_HOST': None,
+    'MONGO_PREMIS_HOST': None,
+    'MONGO_LTS_PORT': 27017,
+    'MONGO_PREMIS_PORT': 27017,
+    'MONGO_LTS_DB': 'lts',
+    'MONGO_PREMIS_DB': 'premis',
+    'BUFF': 65536,
+    '_LTS_FS': None,
+    '_PREMIS_FS': None
 }
 
 
@@ -32,18 +40,6 @@ API = Api(BLUEPRINT)
 
 
 log = logging.getLogger(__name__)
-
-# This is HEAVILY linked to disk read time, and so probably won't scale well
-def get_ids(root):
-    def get_files(path):
-        for entry in scandir(path):
-            if entry.is_file():
-                yield entry.path
-            elif entry.is_dir():
-                yield from get_files(entry.path)
-
-    return [path_to_id(Path(x).relative_to(root).parent.parent) for x in
-            get_files(root)]
 
 
 def check_limit(x):
@@ -59,14 +55,20 @@ class Root(Resource):
         parser.add_argument("limit", type=int, default=1000)
         args = parser.parse_args()
         args['limit'] = check_limit(args['limit'])
-        paginated_ids = sorted(get_ids(BLUEPRINT.config['LTS_PATH']))[args['offset']:args['offset']+args['limit']]
-        return {"materialsuites": [{"identifier": x, "_link": API.url_for(MaterialSuite, id=x)} for x
-                                   in paginated_ids]}
+        return {
+            "materialsuites": [
+                {"identifier": x._id, "_link": API.url_for(MaterialSuite, id=x._id)} for x
+                in BLUEPRINT.config['_PREMIS_FS'].find().sort('_id', ASCENDING).skip(args['offset']).limit(args['limit'])
+            ],
+            "limit": args['limit'],
+            "offset": args['offset']
+        }
+
 
 class MaterialSuite(Resource):
     def get(self, id):
         log.info("GET received @ MaterialSuite endpoint")
-        if Path(BLUEPRINT.config['LTS_PATH'], id_to_path(id), "arf").is_dir():
+        if BLUEPRINT.config['_PREMIS_FS'].find_one({"_id": id}):
             log.debug("Found MaterialSuite with id: {}".format(id))
             return {"premis": API.url_for(MaterialSuitePREMIS, id=id),
                     "content": API.url_for(MaterialSuiteContent, id=id),
@@ -81,12 +83,12 @@ class MaterialSuite(Resource):
 class MaterialSuiteContent(Resource):
     def get(self, id):
         log.info("GET received @ MaterialSuiteContent endpoint")
-        req_path = Path(BLUEPRINT.config['LTS_PATH'], id_to_path(id), "arf",
-                        "content.file")
-        if req_path.is_file():
+        gr_entry = BLUEPRINT.config['_LTS_FS'].find_one({"_id": id})
+        if gr_entry:
             log.debug("Content found for MaterialSuite with id: {}".format(
                 id))
-            return send_file(str(req_path))
+            # TODO - get the mime from the premis and try it?
+            return send_file(gr_entry, mimetype="application/octet-stream")
         log.debug("No content found for MaterialSuite with id: {}".format(
             id))
 
@@ -98,43 +100,18 @@ class MaterialSuiteContent(Resource):
 class MaterialSuitePREMIS(Resource):
     def get(self, id):
         log.info("GET received @ MaterialSuitePremis endpoint")
-        req_path = Path(BLUEPRINT.config['PREMIS_PATH'], id_to_path(id), "arf",
-                        "premis.xml")
-        if req_path.is_file():
-            log.debug("Premis found for MaterialSuite with id: {}".format(
+        gr_entry = BLUEPRINT.config['_PREMIS_FS'].find_one({"_id": id})
+        if gr_entry:
+            log.debug("PREMIS found for MaterialSuite with id: {}".format(
                 id))
-            return send_file(str(req_path))
+            return send_file(gr_entry, mimetype="text/xml")
+
         log.debug("No premis found for MaterialSuite with id: {}".format(
             id))
 
     def put(self, id):
         # TODO
-        # When scaling this microservice this functionality introduces a race
-        # condition if the premis environment is shared amongst nodes.
-        log.info("PUT received @ MaterialSuitePremis endpoint")
-        log.warn("THIS ENDPOINT CURRENTLY INTRODUCES A RACE CONDITION IF " +
-                 "THIS SERVICE IS SCALED OR RUNNING MULTITHREADED")
-        log.debug("Parsing arguments")
-        parser = reqparse.RequestParser()
-        parser.add_argument(
-            "premis",
-            help="The updated PREMIS file",
-            required=True,
-            type=FileStorage,
-            location="files"
-        )
-        args = parser.parse_args()
-        log.debug("Arguments parsed")
-
-        rec_path = Path(BLUEPRINT.config['PREMIS_PATH'], id_to_path(id), "arf",
-                        "premis.xml")
-        if not rec_path.is_file():
-            # you can't use this to create PREMIS records, only update them
-            log.critical("No PREMIS found for {}".format(id))
-            abort(404)
-        log.debug("Saving PREMIS file")
-        args['premis'].save(str(rec_path))
-        return {"_self": API.url_for(MaterialSuitePREMIS, id=id)}
+        pass
 
 
 # RPC-like
@@ -212,49 +189,24 @@ class AddMaterialSuite(Resource):
         else:
             log.debug("Identifier Found: {}".format(identifier))
 
-        content_dir = str(Path(BLUEPRINT.config['LTS_PATH'],
-                               id_to_path(identifier),
-                               "arf"))
-        premis_dir = str(Path(BLUEPRINT.config['PREMIS_PATH'],
-                              id_to_path(identifier),
-                              "arf"))
         log.debug("Creating containing dirs")
-        makedirs(content_dir)
-        makedirs(premis_dir)
-
-        target_content_path = str(Path(content_dir, "content.file"))
-        target_premis_path = str(Path(premis_dir, "premis.xml"))
-        if Path(target_content_path).exists() or \
-                Path(target_premis_path).exists():
-            # Never clobber stuff
-            abort(500)
 
         log.debug("Saving content")
-        args['content'].save(target_content_path)
+        content_target = BLUEPRINT.config['_LTS_FS'].new_file(_id=identifier)
+        args['content'].save(content_target)
+        content_target.close()
         log.debug("Content saved")
-        log.debug("Calculating md5 of file")
-        md5 = None
-        with open(str(target_content_path), "rb") as f:
-            hasher = _md5()
-            data = f.read(BLUEPRINT.config['BUFF'])
-            while data:
-                hasher.update(data)
-                data = f.read(BLUEPRINT.config['BUFF'])
-            md5 = hasher.hexdigest()
-        log.debug("md5 of file calculated: {}".format(md5))
-        log.debug("Retrieving md5 from PREMIS")
-        premis_md5 = get_md5_from_premis(premis_rec)
-        log.debug("PREMIS md5 retrieved: {}".format(premis_md5))
-        if md5 != premis_md5:
-            log.critical("PREMIS md5 and calculated md5 do not match!")
-            abort(500)
-        else:
-            log.debug("Calculated md5 and PREMIS md5 match")
         log.debug("Adding ingest event to PREMIS record")
         add_ingest_event(premis_rec)
         log.debug("Ingest event added")
-        log.debug("Writing PREMIS to file")
-        premis_rec.write_to_file(target_premis_path)
+        log.debug("Writing PREMIS to tmp disk")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_premis_path = str(Path(tmpdir, uuid4().hex))
+            premis_rec.write_to_file(tmp_premis_path)
+            premis_target = BLUEPRINT.config['_PREMIS_FS'].new_file(_id=identifier)
+            with open(tmp_premis_path, 'rb') as f:
+                premis_target.write(f.read())
+                premis_target.close()
         log.debug("PREMIS written")
         return {"created": API.url_for(MaterialSuite, id=identifier)}
 
@@ -263,6 +215,17 @@ class AddMaterialSuite(Resource):
 def handle_configs(setup_state):
     app = setup_state.app
     BLUEPRINT.config.update(app.config)
+
+    _lts_client = MongoClient(BLUEPRINT.config['MONGO_LTS_HOST'],
+                              BLUEPRINT.config['MONGO_LTS_PORT'])
+    _premis_client = MongoClient(BLUEPRINT.config['MONGO_PREMIS_HOST'],
+                                 BLUEPRINT.config['MONGO_PREMIS_PORT'])
+
+    _lts_db = _lts_client[BLUEPRINT.config['MONGO_LTS_DB']]
+    _premis_db = _premis_client[BLUEPRINT.config['MONGO_PREMIS_DB']]
+    BLUEPRINT.config['_LTS_FS'] = GridFS(_lts_db)
+    BLUEPRINT.config['_PREMIS_FS'] = GridFS(_premis_db)
+
     if BLUEPRINT.config.get("TEMPDIR"):
                 tempfile.tempdir = BLUEPRINT.config['TEMPDIR']
     if BLUEPRINT.config.get("VERBOSITY"):
