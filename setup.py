@@ -22,6 +22,7 @@ setup(
         'flask>0',
         'flask_restful',
         'pypremis',
-        'pypairtree'
+        'pypairtree',
+        'pymongo'
     ],
 )
