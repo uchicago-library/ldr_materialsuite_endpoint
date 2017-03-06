@@ -22,8 +22,6 @@ BLUEPRINT = Blueprint('materialsuite_endpoint', __name__)
 
 
 BLUEPRINT.config = {
-    'LTS_PATH': str(Path(tempfile.gettempdir(), 'lts')),
-    'PREMIS_PATH': str(Path(tempfile.gettempdir(), 'premis')),
     'MONGO_LTS_HOST': None,
     'MONGO_PREMIS_HOST': None,
     'MONGO_LTS_PORT': 27017,
