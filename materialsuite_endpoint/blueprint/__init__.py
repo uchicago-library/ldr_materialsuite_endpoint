@@ -28,7 +28,6 @@ BLUEPRINT.config = {
     'MONGO_PREMIS_PORT': 27017,
     'MONGO_LTS_DB': 'lts',
     'MONGO_PREMIS_DB': 'premis',
-    'BUFF': 65536,
     '_LTS_FS': None,
     '_PREMIS_FS': None
 }
