@@ -6,6 +6,7 @@ from hashlib import md5 as _md5
 from json import loads
 import logging
 from xml.etree.ElementTree import tostring, fromstring
+from xml.etree import ElementTree as ET
 from io import BytesIO
 
 from werkzeug.datastructures import FileStorage
@@ -26,6 +27,7 @@ from pypremis.factories import LinkingObjectIdentifierFactory, \
 BLUEPRINT = Blueprint('materialsuite_endpoint', __name__)
 
 GData = GData()
+ET.register_namespace('', "http://www.loc.gov/premis/v3")
 
 BLUEPRINT.config = {
     'MONGO_LTS_HOST': None,
@@ -142,7 +144,7 @@ class MaterialSuitePREMIS(Resource):
             log.debug("PREMIS found for MaterialSuite with id: {}".format(
                 id))
             # Convert JSON to XML
-            xml_element = GData.etree(entry)[0]
+            xml_element = GData.etree(mongo_unescape(entry['premis_json']))[0]
             bytes_obj = BytesIO(tostring(xml_element))
             return send_file(bytes_obj, mimetype="text/xml")
 
