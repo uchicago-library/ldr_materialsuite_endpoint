@@ -3,7 +3,10 @@ from pathlib import Path
 from uuid import uuid4
 from datetime import datetime
 from hashlib import md5 as _md5
+from json import loads
 import logging
+from xml.etree.ElementTree import tostring, fromstring
+from io import BytesIO
 
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
@@ -13,6 +16,8 @@ from flask_restful import Resource, Api, reqparse
 from pymongo import MongoClient, ASCENDING
 from gridfs import GridFS
 
+from xmljson import GData
+
 from pypremis.lib import PremisRecord
 from pypremis.nodes import Event, EventDetailInformation, EventIdentifier
 from pypremis.factories import LinkingObjectIdentifierFactory, \
@@ -20,6 +25,7 @@ from pypremis.factories import LinkingObjectIdentifierFactory, \
 
 BLUEPRINT = Blueprint('materialsuite_endpoint', __name__)
 
+GData = GData()
 
 BLUEPRINT.config = {
     'MONGO_LTS_HOST': None,
@@ -29,7 +35,7 @@ BLUEPRINT.config = {
     'MONGO_LTS_DB': 'lts',
     'MONGO_PREMIS_DB': 'premis',
     '_LTS_FS': None,
-    '_PREMIS_FS': None
+    '_PREMIS_DB': None
 }
 
 
@@ -37,6 +43,40 @@ API = Api(BLUEPRINT)
 
 
 log = logging.getLogger(__name__)
+
+def escape(text):
+    a = text.replace("~", "~~")
+    b = a.replace(".", "~p")
+    c = b.replace("$", "~d")
+    return c
+
+def unescape(text):
+    a = text.replace("~d", "$")
+    b = a.replace("~p", ".")
+    c = b.replace("~~", "~")
+    return c
+
+def change_keys(obj, convert):
+    """
+    Recursively goes through the dictionary obj and replaces keys with the convert function.
+    """
+    if isinstance(obj, (str, int, float)):
+        return obj
+    if isinstance(obj, dict):
+        new = obj.__class__()
+        for k, v in obj.items():
+            new[convert(k)] = change_keys(v, convert)
+    elif isinstance(obj, (list, set, tuple)):
+        new = obj.__class__(change_keys(v, convert) for v in obj)
+    else:
+        return obj
+    return new
+
+def mongo_escape(some_dict):
+    return change_keys(some_dict, escape)
+
+def mongo_unescape(some_dict):
+    return change_keys(some_dict, unescape)
 
 
 def check_limit(x):
@@ -55,7 +95,7 @@ class Root(Resource):
         return {
             "materialsuites": [
                 {"identifier": x._id, "_link": API.url_for(MaterialSuite, id=x._id)} for x
-                in BLUEPRINT.config['_PREMIS_FS'].find().sort('_id', ASCENDING).skip(args['offset']).limit(args['limit'])
+                in BLUEPRINT.config['_PREMIS_DB'].find().sort('_id', ASCENDING).skip(args['offset']).limit(args['limit'])
             ],
             "limit": args['limit'],
             "offset": args['offset']
@@ -65,7 +105,7 @@ class Root(Resource):
 class MaterialSuite(Resource):
     def get(self, id):
         log.info("GET received @ MaterialSuite endpoint")
-        if BLUEPRINT.config['_PREMIS_FS'].find_one({"_id": id}):
+        if BLUEPRINT.config['_PREMIS_DB'].find_one({"_id": id}):
             log.debug("Found MaterialSuite with id: {}".format(id))
             return {"premis": API.url_for(MaterialSuitePREMIS, id=id),
                     "content": API.url_for(MaterialSuiteContent, id=id),
@@ -97,17 +137,39 @@ class MaterialSuiteContent(Resource):
 class MaterialSuitePREMIS(Resource):
     def get(self, id):
         log.info("GET received @ MaterialSuitePremis endpoint")
-        gr_entry = BLUEPRINT.config['_PREMIS_FS'].find_one({"_id": id})
-        if gr_entry:
+        entry = BLUEPRINT.config['_PREMIS_DB'].find_one({"_id": id})
+        if entry:
             log.debug("PREMIS found for MaterialSuite with id: {}".format(
                 id))
-            return send_file(gr_entry, mimetype="text/xml")
+            # Convert JSON to XML
+            xml_element = GData.etree(entry)[0]
+            bytes_obj = BytesIO(tostring(xml_element))
+            return send_file(bytes_obj, mimetype="text/xml")
 
         log.debug("No premis found for MaterialSuite with id: {}".format(
             id))
 
     def put(self, id):
         # TODO
+        pass
+
+class MaterialSuitePREMISJson(Resource):
+    def get(self, id):
+        log.info("GET received @ MaterialSuitePremisJson endpoint")
+        premis = BLUEPRINT.config['_PREMIS_DB'].find_one({"_id": id})
+        return mongo_unescape(premis['premis_json'])
+
+    def put(self, id):
+        log.info("PUT received @ MaterialSuitePremisJson endpoint")
+        parser = reqparse.ArgumentParser()
+        parser.add_argument("premis_json", type=str)
+        args = parser.parse_args()
+
+        BLUEPRINT.config['_PREMIS_DB'].insert_one(
+            {"_id": id, "record": loads(args['premis_json'])}
+        )
+
+    def patch(self, id):
         pass
 
 
@@ -200,10 +262,15 @@ class AddMaterialSuite(Resource):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_premis_path = str(Path(tmpdir, uuid4().hex))
             premis_rec.write_to_file(tmp_premis_path)
-            premis_target = BLUEPRINT.config['_PREMIS_FS'].new_file(_id=identifier)
-            with open(tmp_premis_path, 'rb') as f:
-                premis_target.write(f.read())
-                premis_target.close()
+            with open(tmp_premis_path, 'r') as f:
+                premis_json = GData.data(fromstring(f.read()))
+            BLUEPRINT.config['_PREMIS_DB'].insert_one(
+                {"_id": identifier, "premis_json": mongo_escape(premis_json)}
+            )
+#            premis_target = BLUEPRINT.config['_PREMIS_FS'].new_file(_id=identifier)
+#            with open(tmp_premis_path, 'rb') as f:
+#                premis_target.write(f.read())
+#                premis_target.close()
         log.debug("PREMIS written")
         return {"created": API.url_for(MaterialSuite, id=identifier)}
 
@@ -220,8 +287,9 @@ def handle_configs(setup_state):
 
     _lts_db = _lts_client[BLUEPRINT.config['MONGO_LTS_DB']]
     _premis_db = _premis_client[BLUEPRINT.config['MONGO_PREMIS_DB']]
+    _premis_coll = _premis_db.records
+    BLUEPRINT.config['_PREMIS_DB']= _premis_coll
     BLUEPRINT.config['_LTS_FS'] = GridFS(_lts_db)
-    BLUEPRINT.config['_PREMIS_FS'] = GridFS(_premis_db)
 
     if BLUEPRINT.config.get("TEMPDIR"):
                 tempfile.tempdir = BLUEPRINT.config['TEMPDIR']
@@ -235,3 +303,4 @@ API.add_resource(AddMaterialSuite, "/add")
 API.add_resource(MaterialSuite, "/<string:id>")
 API.add_resource(MaterialSuiteContent, "/<string:id>/content")
 API.add_resource(MaterialSuitePREMIS, "/<string:id>/premis")
+API.add_resource(MaterialSuitePREMISJson, "/<string:id>/premis/json")

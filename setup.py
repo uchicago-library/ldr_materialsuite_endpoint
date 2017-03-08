@@ -23,6 +23,7 @@ setup(
         'flask_restful',
         'pypremis',
         'pypairtree',
-        'pymongo'
+        'pymongo',
+        'xmljson'
     ],
 )
