@@ -5,9 +5,9 @@ from datetime import datetime
 from hashlib import md5 as _md5
 from json import loads
 import logging
-from xml.etree.ElementTree import tostring, fromstring
-from xml.etree import ElementTree as ET
-from io import BytesIO
+from xml.etree.ElementTree import fromstring
+from xml.etree.ElementTree import ElementTree as ETree
+from os.path import join
 
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
@@ -27,7 +27,6 @@ from pypremis.factories import LinkingObjectIdentifierFactory, \
 BLUEPRINT = Blueprint('materialsuite_endpoint', __name__)
 
 GData = GData()
-ET.register_namespace('', "http://www.loc.gov/premis/v3")
 
 BLUEPRINT.config = {
     'MONGO_LTS_HOST': None,
@@ -46,6 +45,7 @@ API = Api(BLUEPRINT)
 
 log = logging.getLogger(__name__)
 
+
 def escape(text):
     a = text.replace("~", "~~")
     b = a.replace(".", "~p")
@@ -58,9 +58,12 @@ def unescape(text):
     c = b.replace("~~", "~")
     return c
 
+
 def change_keys(obj, convert):
+    # http://stackoverflow.com/a/38269945
     """
-    Recursively goes through the dictionary obj and replaces keys with the convert function.
+    Recursively goes through the dictionary obj and replaces keys with the
+    convert function.
     """
     if isinstance(obj, (str, int, float)):
         return obj
@@ -74,8 +77,10 @@ def change_keys(obj, convert):
         return obj
     return new
 
+
 def mongo_escape(some_dict):
     return change_keys(some_dict, escape)
+
 
 def mongo_unescape(some_dict):
     return change_keys(some_dict, unescape)
@@ -96,7 +101,7 @@ class Root(Resource):
         args['limit'] = check_limit(args['limit'])
         return {
             "materialsuites": [
-                {"identifier": x._id, "_link": API.url_for(MaterialSuite, id=x._id)} for x
+                {"identifier": x['_id'], "_link": API.url_for(MaterialSuite, id=x['_id'])} for x
                 in BLUEPRINT.config['_PREMIS_DB'].find().sort('_id', ASCENDING).skip(args['offset']).limit(args['limit'])
             ],
             "limit": args['limit'],
@@ -145,11 +150,24 @@ class MaterialSuitePREMIS(Resource):
                 id))
             # Convert JSON to XML
             xml_element = GData.etree(mongo_unescape(entry['premis_json']))[0]
-            bytes_obj = BytesIO(tostring(xml_element))
-            return send_file(bytes_obj, mimetype="text/xml")
+            tree = ETree(xml_element)
+            # We have to screw around with tempfiles because I'm lazy and
+            # haven't written the functions to load things into PremisRecords
+            # straight from io.
+            # We use pypremis to handle the XML declaration shennanigans and
+            # namespaces as well as the field order issues.
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                fp = join(tmp_dir, uuid4().hex)
+                tree.write(fp, encoding="UTF-8", xml_declaration=True,
+                           method="xml")
+                rec = PremisRecord(frompath=fp)
+                ffp = join(tmp_dir, uuid4().hex)
+                rec.write_to_file(ffp)
+                return send_file(ffp, mimetype="text/xml")
 
         log.debug("No premis found for MaterialSuite with id: {}".format(
             id))
+        abort(404)
 
     def put(self, id):
         # TODO
@@ -269,10 +287,6 @@ class AddMaterialSuite(Resource):
             BLUEPRINT.config['_PREMIS_DB'].insert_one(
                 {"_id": identifier, "premis_json": mongo_escape(premis_json)}
             )
-#            premis_target = BLUEPRINT.config['_PREMIS_FS'].new_file(_id=identifier)
-#            with open(tmp_premis_path, 'rb') as f:
-#                premis_target.write(f.read())
-#                premis_target.close()
         log.debug("PREMIS written")
         return {"created": API.url_for(MaterialSuite, id=identifier)}
 
@@ -290,7 +304,7 @@ def handle_configs(setup_state):
     _lts_db = _lts_client[BLUEPRINT.config['MONGO_LTS_DB']]
     _premis_db = _premis_client[BLUEPRINT.config['MONGO_PREMIS_DB']]
     _premis_coll = _premis_db.records
-    BLUEPRINT.config['_PREMIS_DB']= _premis_coll
+    BLUEPRINT.config['_PREMIS_DB'] = _premis_coll
     BLUEPRINT.config['_LTS_FS'] = GridFS(_lts_db)
 
     if BLUEPRINT.config.get("TEMPDIR"):
