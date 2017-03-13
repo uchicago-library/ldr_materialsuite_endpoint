@@ -6,12 +6,14 @@ from hashlib import md5 as _md5
 from json import loads
 import logging
 from xml.etree.ElementTree import fromstring
+from xml.etree.ElementTree import tostring
 from xml.etree.ElementTree import ElementTree as ETree
 from os.path import join
+from abc import ABCMeta, abstractmethod
 
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
-from flask import Blueprint, abort, send_file
+from flask import Blueprint, abort, send_file, Response
 from flask_restful import Resource, Api, reqparse
 
 from pymongo import MongoClient, ASCENDING
@@ -46,44 +48,165 @@ API = Api(BLUEPRINT)
 log = logging.getLogger(__name__)
 
 
-def escape(text):
-    a = text.replace("~", "~~")
-    b = a.replace(".", "~p")
-    c = b.replace("$", "~d")
-    return c
-
-def unescape(text):
-    a = text.replace("~d", "$")
-    b = a.replace("~p", ".")
-    c = b.replace("~~", "~")
-    return c
+def output_xml(data, code, headers=None):
+    # https://github.com/flask-restful/flask-restful/issues/124
+    resp = Response(data, mimetype='text/xml', headers=headers)
+    resp.status_code = code
+    return resp
 
 
-def change_keys(obj, convert):
-    # http://stackoverflow.com/a/38269945
-    """
-    Recursively goes through the dictionary obj and replaces keys with the
-    convert function.
-    """
-    if isinstance(obj, (str, int, float)):
-        return obj
-    if isinstance(obj, dict):
-        new = obj.__class__()
-        for k, v in obj.items():
-            new[convert(k)] = change_keys(v, convert)
-    elif isinstance(obj, (list, set, tuple)):
-        new = obj.__class__(change_keys(v, convert) for v in obj)
-    else:
-        return obj
-    return new
+class IStorageBackend(metaclass=ABCMeta):
+    @abstractmethod
+    def get_materialsuite_id_list(self, offset, limit):
+        pass
+
+    @abstractmethod
+    def check_materialsuite_exists(self, id):
+        pass
+
+    @abstractmethod
+    def get_materialsuite_content(self, id):
+        # In: str
+        # Out: File like object
+        pass
+
+    @abstractmethod
+    def set_materialsuite_content(self, id, content):
+        # In: str + flask.FileStorage
+        # Out: None
+        pass
+
+    @abstractmethod
+    def get_materialsuite_premis(self, id):
+        # In: str
+        # Out: PremisRecord
+        pass
+
+    @abstractmethod
+    def set_materialsuite_premis(self, id, premis):
+        # In: str + PremisRecord
+        # Out: None
+        pass
+
+    @abstractmethod
+    def diff_materialsuite_premis(self, id, diff):
+        pass
+
+    def get_materialsuite_premis_json(self, id):
+        return GData.data(self.get_materialsuite_premis(id).to_tree().getroot())
 
 
-def mongo_escape(some_dict):
-    return change_keys(some_dict, escape)
+class MongoStorageBackend(IStorageBackend):
+    @staticmethod
+    def escape(text):
+        a = text.replace("~", "~~")
+        b = a.replace(".", "~p")
+        c = b.replace("$", "~d")
+        return c
 
+    @staticmethod
+    def unescape(text):
+        a = text.replace("~d", "$")
+        b = a.replace("~p", ".")
+        c = b.replace("~~", "~")
+        return c
 
-def mongo_unescape(some_dict):
-    return change_keys(some_dict, unescape)
+    @classmethod
+    def change_keys(cls, obj, convert):
+        # http://stackoverflow.com/a/38269945
+        """
+        Recursively goes through the dictionary obj and replaces keys with the
+        convert function.
+        """
+        if isinstance(obj, (str, int, float)):
+            return obj
+        if isinstance(obj, dict):
+            new = obj.__class__()
+            for k, v in obj.items():
+                new[convert(k)] = cls.change_keys(v, convert)
+        elif isinstance(obj, (list, set, tuple)):
+            new = obj.__class__(cls.change_keys(v, convert) for v in obj)
+        else:
+            return obj
+        return new
+
+    @classmethod
+    def mongo_escape(cls, some_dict):
+        return cls.change_keys(some_dict, cls.escape)
+
+    @classmethod
+    def mongo_unescape(cls, some_dict):
+        return cls.change_keys(some_dict, cls.unescape)
+
+    def __init__(self, content_db_host, content_db_port, content_db_name,
+                 premis_db_host, premis_db_port, premis_db_name):
+        self.content_fs = GridFS(
+            MongoClient(content_db_host, content_db_port)[content_db_name]
+        )
+        self.premis_db = MongoClient(premis_db_host, premis_db_port)[premis_db_name].records
+
+    def get_materialsuite_id_list(self, offset, limit):
+        return self.premis_db.find().sort('_id', ASCENDING).skip(offset).limit(limit)
+
+    def check_materialsuite_exists(self, id):
+        if self.premis_db.find_one({"_id": id}):
+            return True
+        return False
+
+    def get_materialsuite_content(self, id):
+        gr_entry = self.content_fs.find_one({"_id": id})
+        return gr_entry
+
+    def check_materialsuite_content_exists(self, id):
+        if self.content_fs.find_one({"_id": id}):
+            return True
+        return False
+
+    def set_materialsuite_content(self, id, content):
+        if self.check_materialsuite_content_exists(id):
+            raise RuntimeError("Does not support overwriting existing " +
+                               "materialsuite content! Content exists for " +
+                               "MaterialSuite {}".format(id))
+        content_target = self.content_fs.new_file(_id=id)
+        content.save(content_target)
+        content_target.close()
+
+    def get_materialsuite_premis(self, id):
+        entry = self.premis_db.find_one({"_id": id})
+        if entry:
+            log.debug("PREMIS found for MaterialSuite with id: {}".format(
+                id))
+            # Convert JSON to XML
+            xml_element = GData.etree(self.mongo_unescape(entry['premis_json']))[0]
+            tree = ETree(xml_element)
+            # We have to screw around with tempfiles because I'm lazy and
+            # haven't written the functions to load things into PremisRecords
+            # straight from io.
+            # We use pypremis to handle the XML declaration shennanigans and
+            # namespaces as well as the field order issues.
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                fp = join(tmp_dir, uuid4().hex)
+                tree.write(fp, encoding="UTF-8", xml_declaration=True,
+                           method="xml")
+                rec = PremisRecord(frompath=fp)
+            return rec
+
+    def check_materialsuite_premis_exists(self, id):
+        if self.premis_db.find_one({"_id": id}):
+            return True
+        return False
+
+    def set_materialsuite_premis(self, id, premis):
+        if self.check_materialsuite_premis_exists(id):
+            log.info("Overwriting PREMIS record for Materialsuite {}".format(id))
+        premis_json = GData.data(premis.to_tree().getroot())
+        print(premis_json)
+        self.premis_db.insert_one(
+            {"_id": id, "premis_json": self.mongo_escape(premis_json)}
+        )
+
+    def diff_materialsuite_premis(self, id, diff):
+        raise NotImplementedError
 
 
 def check_limit(x):
@@ -102,7 +225,7 @@ class Root(Resource):
         return {
             "materialsuites": [
                 {"identifier": x['_id'], "_link": API.url_for(MaterialSuite, id=x['_id'])} for x
-                in BLUEPRINT.config['_PREMIS_DB'].find().sort('_id', ASCENDING).skip(args['offset']).limit(args['limit'])
+                in BLUEPRINT.config['storage'].get_materialsuite_id_list(args['offset'], args['limit'])
             ],
             "limit": args['limit'],
             "offset": args['offset']
@@ -112,11 +235,13 @@ class Root(Resource):
 class MaterialSuite(Resource):
     def get(self, id):
         log.info("GET received @ MaterialSuite endpoint")
-        if BLUEPRINT.config['_PREMIS_DB'].find_one({"_id": id}):
+        if BLUEPRINT.config['storage'].check_materialsuite_exists(id):
             log.debug("Found MaterialSuite with id: {}".format(id))
             return {"premis": API.url_for(MaterialSuitePREMIS, id=id),
                     "content": API.url_for(MaterialSuiteContent, id=id),
                     "_self": API.url_for(MaterialSuite, id=id)}
+        else:
+            return {"message": "No such materialsuite"}
         log.debug("No MaterialSuite found with id: {}".format(id))
 
     # nuclear delete?
@@ -127,12 +252,12 @@ class MaterialSuite(Resource):
 class MaterialSuiteContent(Resource):
     def get(self, id):
         log.info("GET received @ MaterialSuiteContent endpoint")
-        gr_entry = BLUEPRINT.config['_LTS_FS'].find_one({"_id": id})
-        if gr_entry:
+        entry = BLUEPRINT.config['storage'].get_materialsuite_content(id)
+        if entry:
             log.debug("Content found for MaterialSuite with id: {}".format(
                 id))
             # TODO - get the mime from the premis and try it?
-            return send_file(gr_entry, mimetype="application/octet-stream")
+            return send_file(entry, mimetype="application/octet-stream")
         log.debug("No content found for MaterialSuite with id: {}".format(
             id))
 
@@ -144,26 +269,9 @@ class MaterialSuiteContent(Resource):
 class MaterialSuitePREMIS(Resource):
     def get(self, id):
         log.info("GET received @ MaterialSuitePremis endpoint")
-        entry = BLUEPRINT.config['_PREMIS_DB'].find_one({"_id": id})
-        if entry:
-            log.debug("PREMIS found for MaterialSuite with id: {}".format(
-                id))
-            # Convert JSON to XML
-            xml_element = GData.etree(mongo_unescape(entry['premis_json']))[0]
-            tree = ETree(xml_element)
-            # We have to screw around with tempfiles because I'm lazy and
-            # haven't written the functions to load things into PremisRecords
-            # straight from io.
-            # We use pypremis to handle the XML declaration shennanigans and
-            # namespaces as well as the field order issues.
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                fp = join(tmp_dir, uuid4().hex)
-                tree.write(fp, encoding="UTF-8", xml_declaration=True,
-                           method="xml")
-                rec = PremisRecord(frompath=fp)
-                ffp = join(tmp_dir, uuid4().hex)
-                rec.write_to_file(ffp)
-                return send_file(ffp, mimetype="text/xml")
+        if BLUEPRINT.config['storage'].check_materialsuite_premis_exists(id):
+            premis = BLUEPRINT.config['storage'].get_materialsuite_premis(id)
+            return output_xml(tostring(premis.to_tree().getroot(), encoding="unicode"), 200)
 
         log.debug("No premis found for MaterialSuite with id: {}".format(
             id))
@@ -176,21 +284,21 @@ class MaterialSuitePREMIS(Resource):
 class MaterialSuitePREMISJson(Resource):
     def get(self, id):
         log.info("GET received @ MaterialSuitePremisJson endpoint")
-        premis = BLUEPRINT.config['_PREMIS_DB'].find_one({"_id": id})
-        return mongo_unescape(premis['premis_json'])
+        premis = BLUEPRINT.config['storage'].get_materialsuite_premis_json(id)
+        return premis
 
-    def put(self, id):
-        log.info("PUT received @ MaterialSuitePremisJson endpoint")
-        parser = reqparse.ArgumentParser()
-        parser.add_argument("premis_json", type=str)
-        args = parser.parse_args()
-
-        BLUEPRINT.config['_PREMIS_DB'].insert_one(
-            {"_id": id, "record": loads(args['premis_json'])}
-        )
-
-    def patch(self, id):
-        pass
+#    def put(self, id):
+#        log.info("PUT received @ MaterialSuitePremisJson endpoint")
+#        parser = reqparse.ArgumentParser()
+#        parser.add_argument("premis_json", type=str)
+#        args = parser.parse_args()
+#
+#        BLUEPRINT.config['_PREMIS_DB'].insert_one(
+#            {"_id": id, "record": loads(args['premis_json'])}
+#        )
+#
+#    def patch(self, id):
+#        pass
 
 
 # RPC-like
@@ -268,25 +376,16 @@ class AddMaterialSuite(Resource):
         else:
             log.debug("Identifier Found: {}".format(identifier))
 
-        log.debug("Creating containing dirs")
-
         log.debug("Saving content")
-        content_target = BLUEPRINT.config['_LTS_FS'].new_file(_id=identifier)
-        args['content'].save(content_target)
-        content_target.close()
+        BLUEPRINT.config['storage'].set_materialsuite_content(identifier, args['content'])
         log.debug("Content saved")
         log.debug("Adding ingest event to PREMIS record")
         add_ingest_event(premis_rec)
         log.debug("Ingest event added")
+        # TODO: Add fixity check (via interface?) to newly ingested materials
+        # here. Updating PREMIS accordingly.
         log.debug("Writing PREMIS to tmp disk")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_premis_path = str(Path(tmpdir, uuid4().hex))
-            premis_rec.write_to_file(tmp_premis_path)
-            with open(tmp_premis_path, 'r') as f:
-                premis_json = GData.data(fromstring(f.read()))
-            BLUEPRINT.config['_PREMIS_DB'].insert_one(
-                {"_id": identifier, "premis_json": mongo_escape(premis_json)}
-            )
+        BLUEPRINT.config['storage'].set_materialsuite_premis(identifier, premis_rec)
         log.debug("PREMIS written")
         return {"created": API.url_for(MaterialSuite, id=identifier)}
 
@@ -296,16 +395,10 @@ def handle_configs(setup_state):
     app = setup_state.app
     BLUEPRINT.config.update(app.config)
 
-    _lts_client = MongoClient(BLUEPRINT.config['MONGO_LTS_HOST'],
-                              BLUEPRINT.config['MONGO_LTS_PORT'])
-    _premis_client = MongoClient(BLUEPRINT.config['MONGO_PREMIS_HOST'],
-                                 BLUEPRINT.config['MONGO_PREMIS_PORT'])
-
-    _lts_db = _lts_client[BLUEPRINT.config['MONGO_LTS_DB']]
-    _premis_db = _premis_client[BLUEPRINT.config['MONGO_PREMIS_DB']]
-    _premis_coll = _premis_db.records
-    BLUEPRINT.config['_PREMIS_DB'] = _premis_coll
-    BLUEPRINT.config['_LTS_FS'] = GridFS(_lts_db)
+    BLUEPRINT.config['storage'] = MongoStorageBackend(
+        "mongo", 27017, "lts",
+        "mongo", 27017, "premis"
+    )
 
     if BLUEPRINT.config.get("TEMPDIR"):
                 tempfile.tempdir = BLUEPRINT.config['TEMPDIR']
