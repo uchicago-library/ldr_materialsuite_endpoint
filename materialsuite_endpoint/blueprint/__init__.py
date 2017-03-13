@@ -3,9 +3,7 @@ from pathlib import Path
 from uuid import uuid4
 from datetime import datetime
 from hashlib import md5 as _md5
-from json import loads
 import logging
-from xml.etree.ElementTree import fromstring
 from xml.etree.ElementTree import tostring
 from xml.etree.ElementTree import ElementTree as ETree
 from os.path import join
@@ -61,13 +59,13 @@ class IStorageBackend(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def check_materialsuite_exists(self, id):
-        pass
-
-    @abstractmethod
     def get_materialsuite_content(self, id):
         # In: str
         # Out: File like object
+        pass
+
+    @abstractmethod
+    def check_materialsuite_content_exists(self, id):
         pass
 
     @abstractmethod
@@ -83,6 +81,10 @@ class IStorageBackend(metaclass=ABCMeta):
         pass
 
     @abstractmethod
+    def check_materialsuite_premis_exists(self, id):
+        pass
+
+    @abstractmethod
     def set_materialsuite_premis(self, id, premis):
         # In: str + PremisRecord
         # Out: None
@@ -94,6 +96,10 @@ class IStorageBackend(metaclass=ABCMeta):
 
     def get_materialsuite_premis_json(self, id):
         return GData.data(self.get_materialsuite_premis(id).to_tree().getroot())
+
+    def check_materialsuite_exists(self, id):
+        return self.check_materialsuite_content_exists(id) or \
+            self.check_materialsuite_premis_exists(id)
 
 
 class MongoStorageBackend(IStorageBackend):
@@ -209,6 +215,37 @@ class MongoStorageBackend(IStorageBackend):
         raise NotImplementedError
 
 
+class DiskStorageBackend(IStorageBackend):
+    def __init__(self, lts_root, premis_root):
+        raise NotImplementedError()
+        self.lts_root = Path(lts_root)
+        self.premis_root = Path(premis_root)
+
+    def get_materialsuite_id_list(self):
+        raise NotImplementedError()
+
+    def get_materialsuite_content(self, id):
+        pass
+
+    def check_materialsuite_content_exists(self, id):
+        pass
+
+    def set_materialsuite_content(self, id, content):
+        pass
+
+    def get_materialsuite_premis(self, id):
+        pass
+
+    def check_materialsuite_premis_exists(self, id):
+        pass
+
+    def set_materialsuite_premis(self, id, premis):
+        pass
+
+    def diff_materialsuite_premis(self, id, diff):
+        pass
+
+
 def check_limit(x):
     if x > BLUEPRINT.config.get("MAX_LIMIT", 1000):
         return BLUEPRINT.config.get("MAX_LIMIT", 1000)
@@ -280,6 +317,7 @@ class MaterialSuitePREMIS(Resource):
     def put(self, id):
         # TODO
         pass
+
 
 class MaterialSuitePREMISJson(Resource):
     def get(self, id):
