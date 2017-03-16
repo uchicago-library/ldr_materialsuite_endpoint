@@ -1,22 +1,21 @@
 import tempfile
-from pathlib import Path
+from os.path import join
+from os import makedirs
 from uuid import uuid4
 from datetime import datetime
 from hashlib import md5 as _md5
 import logging
 from xml.etree.ElementTree import tostring
 from xml.etree.ElementTree import ElementTree as ETree
-from os.path import join
 from abc import ABCMeta, abstractmethod
+from pathlib import Path
 
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
 from flask import Blueprint, abort, send_file, Response
 from flask_restful import Resource, Api, reqparse
-
 from pymongo import MongoClient, ASCENDING
 from gridfs import GridFS
-
 from xmljson import GData
 
 from pypremis.lib import PremisRecord
@@ -24,20 +23,13 @@ from pypremis.nodes import Event, EventDetailInformation, EventIdentifier
 from pypremis.factories import LinkingObjectIdentifierFactory, \
     LinkingEventIdentifierFactory
 
+from pypairtree.utils import identifier_to_path
+
 BLUEPRINT = Blueprint('materialsuite_endpoint', __name__)
 
 GData = GData()
 
-BLUEPRINT.config = {
-    'MONGO_LTS_HOST': None,
-    'MONGO_PREMIS_HOST': None,
-    'MONGO_LTS_PORT': 27017,
-    'MONGO_PREMIS_PORT': 27017,
-    'MONGO_LTS_DB': 'lts',
-    'MONGO_PREMIS_DB': 'premis',
-    '_LTS_FS': None,
-    '_PREMIS_DB': None
-}
+BLUEPRINT.config = {}
 
 
 API = Api(BLUEPRINT)
@@ -166,7 +158,6 @@ class MongoStorageBackend(IStorageBackend):
         if premis_db_name is None:
             premis_db_name = "premis"
 
-
         self.content_fs = GridFS(
             MongoClient(content_db_host, content_db_port)[content_db_name]
         )
@@ -227,7 +218,6 @@ class MongoStorageBackend(IStorageBackend):
         if self.check_materialsuite_premis_exists(id):
             log.info("Overwriting PREMIS record for Materialsuite {}".format(id))
         premis_json = GData.data(premis.to_tree().getroot())
-        print(premis_json)
         self.premis_db.insert_one(
             {"_id": id, "premis_json": self.mongo_escape(premis_json)}
         )
@@ -236,9 +226,8 @@ class MongoStorageBackend(IStorageBackend):
         raise NotImplementedError
 
 
-class DiskStorageBackend(IStorageBackend):
+class FileSystemStorageBackend(IStorageBackend):
     def __init__(self, lts_root, premis_root):
-        raise NotImplementedError()
         self.lts_root = Path(lts_root)
         self.premis_root = Path(premis_root)
 
@@ -246,25 +235,51 @@ class DiskStorageBackend(IStorageBackend):
         raise NotImplementedError()
 
     def get_materialsuite_content(self, id):
-        pass
+        content_path = Path(
+            self.lts_root, identifier_to_path(id), "arf", "content.file"
+        )
+        return open(str(content_path))
 
     def check_materialsuite_content_exists(self, id):
-        pass
+        content_path = Path(
+            self.lts_root, identifier_to_path(id), "arf", "content.file"
+        )
+        return content_path.is_file()
 
     def set_materialsuite_content(self, id, content):
-        pass
+        if self.check_materialsuite_content_exists(id):
+            raise ValueError()
+        content_path = Path(
+            self.lts_root, identifier_to_path(id), "arf", "content.file"
+        )
+        makedirs(str(content_path.parent), exist_ok=True)
+        content.save(str(content_path))
 
     def get_materialsuite_premis(self, id):
-        pass
+        premis_path = Path(
+            self.premis_root, identifier_to_path(id), "arf", "premis.xml"
+        )
+        rec = PremisRecord(frompath=str(premis_path))
+        print(str(rec))
+        return rec
 
     def check_materialsuite_premis_exists(self, id):
-        pass
+        premis_path = Path(
+            self.premis_root, identifier_to_path(id), "arf", "premis.xml"
+        )
+        return premis_path.is_file()
 
     def set_materialsuite_premis(self, id, premis):
-        pass
+        if self.check_materialsuite_premis_exists(id):
+            log.warn("overwriting PREMIS {}".format(id))
+        premis_path = Path(
+            self.premis_root, identifier_to_path(id), "arf", "premis.xml"
+        )
+        makedirs(str(premis_path.parent), exist_ok=True)
+        premis.write_to_file(str(premis_path))
 
     def diff_materialsuite_premis(self, id, diff):
-        pass
+        raise NotImplementedError
 
 
 def check_limit(x):
@@ -462,6 +477,11 @@ def handle_configs(setup_state):
             bp.config.get('PREMIS_MONGO_DB_NAME')
         )
 
+    def init_filesystem(bp):
+        bp.config['storage'] = FileSystemStorageBackend(
+            bp.config['LTS_DIR'],
+            bp.config['PREMIS_DIR']
+        )
 
     app = setup_state.app
     BLUEPRINT.config.update(app.config)
@@ -471,6 +491,7 @@ def handle_configs(setup_state):
     # from the application context to hack something in
     supported_backends = {
         'mongo': init_mongo,
+        'filesystem': init_filesystem,
         'noerror': None
     }
     if storage_choice.lower() not in supported_backends:
