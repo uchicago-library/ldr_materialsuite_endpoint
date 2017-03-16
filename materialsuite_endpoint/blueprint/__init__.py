@@ -144,8 +144,29 @@ class MongoStorageBackend(IStorageBackend):
     def mongo_unescape(cls, some_dict):
         return cls.change_keys(some_dict, cls.unescape)
 
-    def __init__(self, content_db_host, content_db_port, content_db_name,
-                 premis_db_host, premis_db_port, premis_db_name):
+    def __init__(self, content_db_host, content_db_port=None,
+                 content_db_name=None,
+                 premis_db_host=None, premis_db_port=None,
+                 premis_db_name=None):
+
+        # Sensible defaults for mongo options. Use the same mongod for content
+        # and PREMIS if a PREMIS specific one isn't specified.
+        # NOTE: In production using the same mongod for both things  probably
+        # isn't a good idea, because of RAM churning and other complicated
+        # database-y things I'm no expert at.
+
+        if content_db_port is None:
+            content_db_port = 27017
+        if content_db_name is None:
+            content_db_name = "lts"
+        if premis_db_host is None:
+            premis_db_host = content_db_host
+        if premis_db_port is None:
+            premis_db_port = content_db_port
+        if premis_db_name is None:
+            premis_db_name = "premis"
+
+
         self.content_fs = GridFS(
             MongoClient(content_db_host, content_db_port)[content_db_name]
         )
@@ -430,13 +451,37 @@ class AddMaterialSuite(Resource):
 
 @BLUEPRINT.record
 def handle_configs(setup_state):
+
+    def init_mongo(bp):
+        bp.config['storage'] = MongoStorageBackend(
+            bp.config['LTS_MONGO_HOST'],
+            bp.config.get('LTS_MONGO_PORT'),
+            bp.config.get('LTS_MONGO_DB_NAME'),
+            bp.config.get('PREMIS_MONGO_HOST'),
+            bp.config.get('PREMIS_MONGO_PORT'),
+            bp.config.get('PREMIS_MONGO_DB_NAME')
+        )
+
+
     app = setup_state.app
     BLUEPRINT.config.update(app.config)
 
-    BLUEPRINT.config['storage'] = MongoStorageBackend(
-        "mongo", 27017, "lts",
-        "mongo", 27017, "premis"
-    )
+    storage_choice = BLUEPRINT.config['STORAGE_BACKEND']
+    # NOERROR for in case they want to do something tricky with the bp config
+    # from the application context to hack something in
+    supported_backends = {
+        'mongo': init_mongo,
+        'noerror': None
+    }
+    if storage_choice.lower() not in supported_backends:
+        raise RuntimeError(
+            "Supported storage backends include: " +
+            "{}".format(", ".join(supported_backends.keys()))
+        )
+    elif storage_choice.lower() == 'noerror':
+        pass
+    else:
+        supported_backends.get(storage_choice.lower())(BLUEPRINT)
 
     if BLUEPRINT.config.get("TEMPDIR"):
                 tempfile.tempdir = BLUEPRINT.config['TEMPDIR']
