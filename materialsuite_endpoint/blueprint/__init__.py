@@ -281,6 +281,34 @@ class FileSystemStorageBackend(IStorageBackend):
     def diff_materialsuite_premis(self, id, diff):
         raise NotImplementedError
 
+class FileContentMongoPremisStorageBackend(IStorageBackend):
+    escape = MongoStorageBackend.escape
+    unescape = MongoStorageBackend.unescape
+    change_keys = MongoStorageBackend.change_keys
+    mongo_escape = MongoStorageBackend.mongo_escape
+    mongo_unescape = MongoStorageBackend.mongo_unescape
+
+    def __init__(self, lts_root, premis_db_host, premis_db_port=None,
+                 premis_db_name=None):
+        if premis_db_port is None:
+            premis_db_port = 27017
+        if premis_db_name is None:
+            premis_db_name = 'premis'
+
+        self.lts_root = Path(lts_root)
+        self.premis_db = MongoClient(premis_db_host, premis_db_port)[premis_db_name].records
+
+    get_materialsuite_id_list = FileSystemStorageBackend.get_materialsuite_id_list
+    check_materialsuite_exists = MongoStorageBackend.check_materialsuite_exists
+    get_materialsuite_content = FileSystemStorageBackend.get_materialsuite_content
+    check_materialsuite_content_exists = FileSystemStorageBackend.check_materialsuite_content_exists
+    set_materialsuite_content = FileSystemStorageBackend.set_materialsuite_content
+    get_materialsuite_premis = MongoStorageBackend.get_materialsuite_premis
+    check_materialsuite_premis_exists = MongoStorageBackend.check_materialsuite_premis_exists
+    set_materialsuite_premis = MongoStorageBackend.set_materialsuite_premis
+    diff_materialsuite_premis = MongoStorageBackend.diff_materialsuite_premis
+
+
 
 def check_limit(x):
     if x > BLUEPRINT.config.get("MAX_LIMIT", 1000):
@@ -483,6 +511,14 @@ def handle_configs(setup_state):
             bp.config['PREMIS_DIR']
         )
 
+    def init_mix(bp):
+        bp.config['storage'] = FileContentMongoPremisStorageBackend(
+            bp.config['LTS_DIR'],
+            bp.config['PREMIS_MONGO_HOST'],
+            bp.config.get('PREMIS_MONGO_PORT'),
+            bp.config.get('PREMIS_MONGO_DB_NAME')
+        )
+
     app = setup_state.app
     BLUEPRINT.config.update(app.config)
 
@@ -492,6 +528,7 @@ def handle_configs(setup_state):
     supported_backends = {
         'mongo': init_mongo,
         'filesystem': init_filesystem,
+        'mix': init_mix,
         'noerror': None
     }
     if storage_choice.lower() not in supported_backends:
