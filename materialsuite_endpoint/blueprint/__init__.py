@@ -226,6 +226,34 @@ class MongoStorageBackend(IStorageBackend):
         raise NotImplementedError
 
 
+class MongoPremisStorageBackendMixin:
+    # Inheriting classes must set self.premis_db
+    # See MongoStorageBackend init
+    escape = MongoStorageBackend.escape
+    unescape = MongoStorageBackend.unescape
+    change_keys = MongoStorageBackend.change_keys
+    mongo_escape = MongoStorageBackend.mongo_escape
+    mongo_unescape = MongoStorageBackend.mongo_unescape
+    get_materialsuite_premis = MongoStorageBackend.get_materialsuite_premis
+    check_materialsuite_premis_exists = MongoStorageBackend.check_materialsuite_premis_exists
+    set_materialsuite_premis = MongoStorageBackend.set_materialsuite_premis
+    diff_materialsuite_premis = MongoStorageBackend.diff_materialsuite_premis
+
+class GridFSContentStorageBackendMixin:
+    # Inheriting classes must set self.content_fs
+    # See MongoStorageBackend init
+    escape = MongoStorageBackend.escape
+    unescape = MongoStorageBackend.unescape
+    change_keys = MongoStorageBackend.change_keys
+    mongo_escape = MongoStorageBackend.mongo_escape
+    mongo_unescape = MongoStorageBackend.mongo_unescape
+    get_materialsuite_id_list = MongoStorageBackend.get_materialsuite_id_list
+    check_materialsuite_exists = MongoStorageBackend.check_materialsuite_exists
+    get_materialsuite_content = MongoStorageBackend.get_materialsuite_content
+    check_materialsuite_content_exists = MongoStorageBackend.check_materialsuite_content_exists
+    set_materialsuite_content = MongoStorageBackend.set_materialsuite_content
+
+
 class FileSystemStorageBackend(IStorageBackend):
     def __init__(self, lts_root, premis_root):
         self.lts_root = Path(lts_root)
@@ -281,13 +309,24 @@ class FileSystemStorageBackend(IStorageBackend):
     def diff_materialsuite_premis(self, id, diff):
         raise NotImplementedError
 
-class FileContentMongoPremisStorageBackend(IStorageBackend):
-    escape = MongoStorageBackend.escape
-    unescape = MongoStorageBackend.unescape
-    change_keys = MongoStorageBackend.change_keys
-    mongo_escape = MongoStorageBackend.mongo_escape
-    mongo_unescape = MongoStorageBackend.mongo_unescape
 
+
+class FileSystemContentStorageBackendMixin:
+    # Inheriting classes must set self.lts_root
+    # See FileSystemStorageBackend init
+    get_materialsuite_id_list = FileSystemStorageBackend.get_materialsuite_id_list
+    check_materialsuite_exists = FileSystemStorageBackend.check_materialsuite_exists
+    get_materialsuite_content = FileSystemStorageBackend.get_materialsuite_content
+    check_materialsuite_content_exists = FileSystemStorageBackend.check_materialsuite_content_exists
+    set_materialsuite_content = FileSystemStorageBackend.set_materialsuite_content
+
+
+
+class FileContentMongoPremisStorageBackend(
+    FileSystemContentStorageBackendMixin,
+    MongoPremisStorageBackendMixin,
+    IStorageBackend
+):
     def __init__(self, lts_root, premis_db_host, premis_db_port=None,
                  premis_db_name=None):
         if premis_db_port is None:
@@ -298,16 +337,21 @@ class FileContentMongoPremisStorageBackend(IStorageBackend):
         self.lts_root = Path(lts_root)
         self.premis_db = MongoClient(premis_db_host, premis_db_port)[premis_db_name].records
 
-    get_materialsuite_id_list = FileSystemStorageBackend.get_materialsuite_id_list
-    check_materialsuite_exists = MongoStorageBackend.check_materialsuite_exists
-    get_materialsuite_content = FileSystemStorageBackend.get_materialsuite_content
-    check_materialsuite_content_exists = FileSystemStorageBackend.check_materialsuite_content_exists
-    set_materialsuite_content = FileSystemStorageBackend.set_materialsuite_content
-    get_materialsuite_premis = MongoStorageBackend.get_materialsuite_premis
-    check_materialsuite_premis_exists = MongoStorageBackend.check_materialsuite_premis_exists
-    set_materialsuite_premis = MongoStorageBackend.set_materialsuite_premis
-    diff_materialsuite_premis = MongoStorageBackend.diff_materialsuite_premis
+#    get_materialsuite_id_list = FileSystemStorageBackend.get_materialsuite_id_list
+#    check_materialsuite_exists = MongoStorageBackend.check_materialsuite_exists
+#    get_materialsuite_content = FileSystemStorageBackend.get_materialsuite_content
+#    check_materialsuite_content_exists = FileSystemStorageBackend.check_materialsuite_content_exists
+#    set_materialsuite_content = FileSystemStorageBackend.set_materialsuite_content
 
+
+class SwiftContentStorageBackendMixin:
+    # TODO
+    pass
+
+
+class S3ContentStorageBackendMixin:
+    # TODO
+    pass
 
 
 def check_limit(x):
