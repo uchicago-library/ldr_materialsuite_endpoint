@@ -10,12 +10,30 @@ from xml.etree.ElementTree import ElementTree as ETree
 from abc import ABCMeta, abstractmethod
 from pathlib import Path
 
+try:
+    import boto3
+    import botocore
+except:
+    # Hope we're not using the s3 backend
+    pass
+
+try:
+    from pymongo import MongoClient, ASCENDING
+    from gridfs import GridFS
+except:
+    # Hope we're not using a mongo backend
+    pass
+
+try:
+    from pypairtree.utils import identifier_to_path
+except:
+    # Hope we're not using a file system backend
+    pass
+
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
-from flask import Blueprint, abort, send_file, Response
+from flask import Blueprint, abort, send_file, Response, stream_with_context
 from flask_restful import Resource, Api, reqparse
-from pymongo import MongoClient, ASCENDING
-from gridfs import GridFS
 from xmljson import GData
 
 from pypremis.lib import PremisRecord
@@ -23,19 +41,20 @@ from pypremis.nodes import Event, EventDetailInformation, EventIdentifier
 from pypremis.factories import LinkingObjectIdentifierFactory, \
     LinkingEventIdentifierFactory
 
-from pypairtree.utils import identifier_to_path
 
 BLUEPRINT = Blueprint('materialsuite_endpoint', __name__)
 
-GData = GData()
 
-BLUEPRINT.config = {}
+BLUEPRINT.config = {'BUFF': 1024*16}
 
 
 API = Api(BLUEPRINT)
 
 
 log = logging.getLogger(__name__)
+
+
+GData = GData()
 
 
 def output_xml(data, code, headers=None):
@@ -321,14 +340,13 @@ class FileSystemContentStorageBackendMixin:
     set_materialsuite_content = FileSystemStorageBackend.set_materialsuite_content
 
 
-
 class FileContentMongoPremisStorageBackend(
     FileSystemContentStorageBackendMixin,
     MongoPremisStorageBackendMixin,
     IStorageBackend
 ):
-    def __init__(self, lts_root, premis_db_host, premis_db_port=None,
-                 premis_db_name=None):
+    def __init__(self, lts_root,
+                 premis_db_host, premis_db_port=None, premis_db_name=None):
         if premis_db_port is None:
             premis_db_port = 27017
         if premis_db_name is None:
@@ -337,21 +355,75 @@ class FileContentMongoPremisStorageBackend(
         self.lts_root = Path(lts_root)
         self.premis_db = MongoClient(premis_db_host, premis_db_port)[premis_db_name].records
 
-#    get_materialsuite_id_list = FileSystemStorageBackend.get_materialsuite_id_list
-#    check_materialsuite_exists = MongoStorageBackend.check_materialsuite_exists
-#    get_materialsuite_content = FileSystemStorageBackend.get_materialsuite_content
-#    check_materialsuite_content_exists = FileSystemStorageBackend.check_materialsuite_content_exists
-#    set_materialsuite_content = FileSystemStorageBackend.set_materialsuite_content
-
 
 class SwiftContentStorageBackendMixin:
-    # TODO
-    pass
+    def get_materialsuite_id_list(self):
+        pass
+
+    def get_materialsuite_content(self, id):
+        pass
+
+    def check_materialsuite_exists(self, id):
+        pass
+
+    def check_materialsuite_content_exists(self, id):
+        pass
+
+    def set_materialsuite_content(self, id, content):
+        pass
 
 
 class S3ContentStorageBackendMixin:
-    # TODO
-    pass
+    def s3_init(self, bucket_name, region_name=None, aws_access_key_id=None, aws_secret_access_key=None):
+        # Helper init for inheriting classes.
+        self.s3 = boto3.client(
+            's3', region_name=region_name, aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key
+        )
+        self.bucket = bucket_name
+        exists = True
+        try:
+            self.s3.head_bucket(Bucket=bucket_name)
+        except botocore.exceptions.ClientError as e:
+            error_code = int(e.response['Error']['Code'])
+            if error_code == 404:
+                exists = False
+        if not exists:
+            # Init the bucket
+            self.s3.create_bucket(Bucket=bucket_name)
+
+    def get_materialsuite_id_list(self, offset, limit):
+        # TODO: Actually use api implementations of item queries
+        return self.s3.list_objects(Bucket=self.bucket)[offset:offset+limit]
+
+    def get_materialsuite_content(self, id):
+        obj = self.s3.get_object(Bucket=BLUEPRINT.config['storage'].name, Key=id)
+        return obj['Body']
+
+    def check_materialsuite_content_exists(self, id):
+        try:
+            self.s3.head_object(Bucket=self.bucket)
+            return True
+        except botocore.exceptions.ClientError as e:
+            error_code = int(e.response['Error']['Code'])
+            if error_code == 404:
+                return False
+
+    def set_materialsuite_content(self, id, content):
+        if self.check_materialsuite_exists(id):
+            raise ValueError()
+        self.s3.Object(BLUEPRINT.config['storage'].name, id).put(Body=content)
+
+class S3ContentMongoPremisStorageBackend(
+    S3ContentStorageBackendMixin,
+    MongoPremisStorageBackendMixin,
+    IStorageBackend
+):
+    def __init__(self, bucket_name, premis_db_host,
+                 region_name=None, aws_access_key_id=None, aws_secret_access_key=None,
+                 premis_db_port=None, premis_db_name=None):
+        # TODO
+        pass
 
 
 def check_limit(x):
@@ -396,13 +468,21 @@ class MaterialSuite(Resource):
 
 class MaterialSuiteContent(Resource):
     def get(self, id):
+
+        def generate(e):
+            data = True
+            while data:
+                data = e.read(BLUEPRINT.config['BUFF'])
+                yield data
+
         log.info("GET received @ MaterialSuiteContent endpoint")
         entry = BLUEPRINT.config['storage'].get_materialsuite_content(id)
         if entry:
             log.debug("Content found for MaterialSuite with id: {}".format(
                 id))
             # TODO - get the mime from the premis and try it?
-            return send_file(entry, mimetype="application/octet-stream")
+#            return send_file(entry, mimetype="application/octet-stream")
+            return Response(stream_with_context(generate(entry)))
         log.debug("No content found for MaterialSuite with id: {}".format(
             id))
 
@@ -538,6 +618,10 @@ class AddMaterialSuite(Resource):
 
 @BLUEPRINT.record
 def handle_configs(setup_state):
+
+    def init_S3ContentMongoPremis(bp):
+        pass
+
 
     def init_mongo(bp):
         bp.config['storage'] = MongoStorageBackend(
