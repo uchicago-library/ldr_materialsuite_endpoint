@@ -1,14 +1,12 @@
 import tempfile
-from os.path import join
 from os import makedirs
 from uuid import uuid4
 from datetime import datetime
 from hashlib import md5 as _md5
 import logging
-from xml.etree.ElementTree import tostring
-from xml.etree.ElementTree import ElementTree as ETree
 from abc import ABCMeta, abstractmethod
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 try:
     import boto3
@@ -32,9 +30,8 @@ except:
 
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
-from flask import Blueprint, abort, send_file, Response, stream_with_context
+from flask import Blueprint, abort, Response, stream_with_context
 from flask_restful import Resource, Api, reqparse
-from xmljson import GData
 
 from pypremis.lib import PremisRecord
 from pypremis.nodes import Event, EventDetailInformation, EventIdentifier
@@ -52,9 +49,6 @@ API = Api(BLUEPRINT)
 
 
 log = logging.getLogger(__name__)
-
-
-GData = GData()
 
 
 def output_xml(data, code, headers=None):
@@ -104,9 +98,6 @@ class IStorageBackend(metaclass=ABCMeta):
     @abstractmethod
     def diff_materialsuite_premis(self, id, diff):
         pass
-
-    def get_materialsuite_premis_json(self, id):
-        return GData.data(self.get_materialsuite_premis(id).to_tree().getroot())
 
     def check_materialsuite_exists(self, id):
         return self.check_materialsuite_content_exists(id) or \
@@ -213,20 +204,7 @@ class MongoStorageBackend(IStorageBackend):
         if entry:
             log.debug("PREMIS found for MaterialSuite with id: {}".format(
                 id))
-            # Convert JSON to XML
-            xml_element = GData.etree(self.mongo_unescape(entry['premis_json']))[0]
-            tree = ETree(xml_element)
-            # We have to screw around with tempfiles because I'm lazy and
-            # haven't written the functions to load things into PremisRecords
-            # straight from io.
-            # We use pypremis to handle the XML declaration shennanigans and
-            # namespaces as well as the field order issues.
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                fp = join(tmp_dir, uuid4().hex)
-                tree.write(fp, encoding="UTF-8", xml_declaration=True,
-                           method="xml")
-                rec = PremisRecord(frompath=fp)
-            return rec
+            return self.mongo_unescape(PremisRecord.from_dict(entry['premis_json']))
 
     def check_materialsuite_premis_exists(self, id):
         if self.premis_db.find_one({"_id": id}):
@@ -236,9 +214,9 @@ class MongoStorageBackend(IStorageBackend):
     def set_materialsuite_premis(self, id, premis):
         if self.check_materialsuite_premis_exists(id):
             log.info("Overwriting PREMIS record for Materialsuite {}".format(id))
-        premis_json = GData.data(premis.to_tree().getroot())
+        premis = PremisRecord.from_dict(premis.to_json())
         self.premis_db.insert_one(
-            {"_id": id, "premis_json": self.mongo_escape(premis_json)}
+            {"_id": id, "premis_json": self.mongo_escape(premis.to_json())}
         )
 
     def diff_materialsuite_premis(self, id, diff):
@@ -257,6 +235,7 @@ class MongoPremisStorageBackendMixin:
     check_materialsuite_premis_exists = MongoStorageBackend.check_materialsuite_premis_exists
     set_materialsuite_premis = MongoStorageBackend.set_materialsuite_premis
     diff_materialsuite_premis = MongoStorageBackend.diff_materialsuite_premis
+
 
 class GridFSContentStorageBackendMixin:
     # Inheriting classes must set self.content_fs
@@ -327,7 +306,6 @@ class FileSystemStorageBackend(IStorageBackend):
 
     def diff_materialsuite_premis(self, id, diff):
         raise NotImplementedError
-
 
 
 class FileSystemContentStorageBackendMixin:
@@ -414,6 +392,7 @@ class S3ContentStorageBackendMixin:
             raise ValueError()
         self.s3.Object(BLUEPRINT.config['storage'].name, id).put(Body=content)
 
+
 class S3ContentMongoPremisStorageBackend(
     S3ContentStorageBackendMixin,
     MongoPremisStorageBackendMixin,
@@ -491,12 +470,12 @@ class MaterialSuiteContent(Resource):
         pass
 
 
-class MaterialSuitePREMIS(Resource):
+class MaterialSuitePREMISJSON(Resource):
     def get(self, id):
-        log.info("GET received @ MaterialSuitePremis endpoint")
+        log.info("GET received @ MaterialSuitePremis json endpoint")
         if BLUEPRINT.config['storage'].check_materialsuite_premis_exists(id):
             premis = BLUEPRINT.config['storage'].get_materialsuite_premis(id)
-            return output_xml(tostring(premis.to_tree().getroot(), encoding="unicode"), 200)
+            return premis.to_json()
 
         log.debug("No premis found for MaterialSuite with id: {}".format(
             id))
@@ -507,24 +486,17 @@ class MaterialSuitePREMIS(Resource):
         pass
 
 
-class MaterialSuitePREMISJson(Resource):
+class MaterialSuitePREMISXML(Resource):
     def get(self, id):
-        log.info("GET received @ MaterialSuitePremisJson endpoint")
-        premis = BLUEPRINT.config['storage'].get_materialsuite_premis_json(id)
-        return premis
+        log.info("GET received @ MaterialSuitePremis xml endpoint")
+        if BLUEPRINT.config['storage'].check_materialsuite_premis_exists(id):
+            premis_dict = BLUEPRINT.config['storage'].get_materialsuite_premis(id).to_json()
+            premis_etree = PremisRecord.from_dict(premis_dict).to_etree()
+            return output_xml(ET.tostring(premis_etree.getroot(), encoding="UTF-8", method="xml"), 200)
 
-#    def put(self, id):
-#        log.info("PUT received @ MaterialSuitePremisJson endpoint")
-#        parser = reqparse.ArgumentParser()
-#        parser.add_argument("premis_json", type=str)
-#        args = parser.parse_args()
-#
-#        BLUEPRINT.config['_PREMIS_DB'].insert_one(
-#            {"_id": id, "record": loads(args['premis_json'])}
-#        )
-#
-#    def patch(self, id):
-#        pass
+        log.debug("No premis found for MaterialSuite with id: {}".format(
+            id))
+        abort(404)
 
 
 # RPC-like
@@ -589,7 +561,7 @@ class AddMaterialSuite(Resource):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_premis_path = str(Path(tmpdir, uuid4().hex))
             args['premis'].save(tmp_premis_path)
-            premis_rec = PremisRecord(frompath=tmp_premis_path)
+            premis_rec = PremisRecord.from_xml_file(tmp_premis_path)
         log.debug("Getting the identifier")
         identifier = premis_rec.get_object_list()[0].\
             get_objectIdentifier()[0].\
@@ -610,7 +582,6 @@ class AddMaterialSuite(Resource):
         log.debug("Ingest event added")
         # TODO: Add fixity check (via interface?) to newly ingested materials
         # here. Updating PREMIS accordingly.
-        log.debug("Writing PREMIS to tmp disk")
         BLUEPRINT.config['storage'].set_materialsuite_premis(identifier, premis_rec)
         log.debug("PREMIS written")
         return {"created": API.url_for(MaterialSuite, id=identifier)}
@@ -618,10 +589,8 @@ class AddMaterialSuite(Resource):
 
 @BLUEPRINT.record
 def handle_configs(setup_state):
-
     def init_S3ContentMongoPremis(bp):
         pass
-
 
     def init_mongo(bp):
         bp.config['storage'] = MongoStorageBackend(
@@ -680,5 +649,6 @@ API.add_resource(Root, "/")
 API.add_resource(AddMaterialSuite, "/add")
 API.add_resource(MaterialSuite, "/<string:id>")
 API.add_resource(MaterialSuiteContent, "/<string:id>/content")
-API.add_resource(MaterialSuitePREMIS, "/<string:id>/premis")
-API.add_resource(MaterialSuitePREMISJson, "/<string:id>/premis/json")
+# Use JSON by default
+API.add_resource(MaterialSuitePREMISJSON, "/<string:id>/premis")
+API.add_resource(MaterialSuitePREMISXML, "/<string:id>/premis/xml")

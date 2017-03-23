@@ -14,7 +14,7 @@ setup(
     ),
     dependency_links = [
         'https://github.com/uchicago-library/uchicagoldr-premiswork' +
-        '/tarball/master#egg=pypremis',
+        '/tarball/json_out#egg=pypremis',
         'https://github.com/bnbalsamo/pypairtree' +
         '/tarball/master#egg=pypairtree'
     ],
@@ -23,7 +23,6 @@ setup(
         'flask_restful',
         'pypremis',
         'pypairtree',
-        'pymongo',
-        'xmljson'
+        'pymongo'
     ],
 )
